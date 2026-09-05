@@ -2,6 +2,9 @@ import os
 import secrets
 import string
 import libsql
+import hmac
+import hashlib
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -14,6 +17,8 @@ TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
 SECRET_KEY = os.environ.get("SECRET_KEY", "troque-este-secret-tambem")
+# O SEGREDO AGORA É LIDO DAS VARIÁVEIS DE AMBIENTE DO RENDER
+HEARTBEAT_SECRET = os.environ.get("HEARTBEAT_SECRET", "EADMT4-PRO-HEARTBEAT-2026-SECRET")
 
 TRIAL_DAYS = 2
 LICENSE_DAYS = 30
@@ -62,6 +67,31 @@ class CheckRequest(BaseModel):
     license_key: str = ""
 
 
+def _build_response(status: str, machine_id: str, expires_at, days_left: int):
+    """Função auxiliar que garante que TODA resposta tenha a assinatura (sig) do servidor"""
+    timestamp = int(time.time())
+    payload_to_sign = f"{status}|{machine_id}|{timestamp}"
+    
+    sig = hmac.new(
+        HEARTBEAT_SECRET.encode('utf-8'),
+        payload_to_sign.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    
+    exp_str = None
+    if isinstance(expires_at, datetime):
+        exp_str = expires_at.isoformat()
+    elif isinstance(expires_at, str):
+        exp_str = expires_at
+        
+    return {
+        "status": status,
+        "expires_at": exp_str,
+        "days_left": max(0, int(days_left)),
+        "sig": sig  # <--- AQUI ESTÁ A ASSINATURA QUE O PYTHON ESPERA
+    }
+
+
 @app.post("/api/check")
 def check_license(payload: CheckRequest):
     conn = get_db()
@@ -91,7 +121,7 @@ def check_license(payload: CheckRequest):
 
     if key and key_error:
         conn.close()
-        return {"status": key_error, "expires_at": None, "days_left": 0}
+        return _build_response(key_error, payload.machine_id, None, 0)
 
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
@@ -109,7 +139,8 @@ def check_license(payload: CheckRequest):
             if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
                 conn.commit()
                 conn.close()
-                return {"status": "limit", "expires_at": None, "days_left": 0}
+                return _build_response("limit", payload.machine_id, None, 0)
+            
             conn.execute(
                 "INSERT INTO licenses (machine_id, machine_name, first_seen, trial_expires, license_expires, last_seen, license_key) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -125,11 +156,7 @@ def check_license(payload: CheckRequest):
             )
             conn.commit()
             conn.close()
-            return {
-                "status": "licensed",
-                "expires_at": kexp.isoformat(),
-                "days_left": max(0, (kexp - now).days),
-            }
+            return _build_response("licensed", payload.machine_id, kexp, (kexp - now).days)
 
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0 "
@@ -138,11 +165,7 @@ def check_license(payload: CheckRequest):
         )
         conn.commit()
         conn.close()
-        return {
-            "status": "licensed",
-            "expires_at": kexp.isoformat(),
-            "days_left": max(0, (kexp - now).days),
-        }
+        return _build_response("licensed", payload.machine_id, kexp, (kexp - now).days)
 
     if row is None:
         first_seen = now
@@ -155,6 +178,7 @@ def check_license(payload: CheckRequest):
         conn.commit()
         status = "trial"
         expires_at = trial_expires
+        days_left = TRIAL_DAYS
     else:
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ? WHERE machine_id = ?",
@@ -165,6 +189,7 @@ def check_license(payload: CheckRequest):
         if row["revoked"]:
             status = "revoked"
             expires_at = None
+            days_left = 0
         else:
             license_expires = parse_dt(row["license_expires"])
             trial_expires = parse_dt(row["trial_expires"])
@@ -172,24 +197,22 @@ def check_license(payload: CheckRequest):
             if license_expires and license_expires > now:
                 status = "licensed"
                 expires_at = license_expires
+                days_left = (license_expires - now).days
             elif trial_expires and trial_expires > now:
                 status = "trial"
                 expires_at = trial_expires
+                days_left = (trial_expires - now).days
             else:
                 status = "expired"
                 expires_at = None
+                days_left = 0
 
     conn.close()
-    return {
-        "status": status,
-        "expires_at": expires_at.isoformat() if expires_at else None,
-        "days_left": max(0, (expires_at - now).days) if expires_at else 0,
-    }
+    return _build_response(status, payload.machine_id, expires_at, days_left)
 
 
 # ----------------------------------------------------------------------
-# NOVO VISUAL — CORES DA DERIV
-# Vermelho #ff444f, fundo claro #f5f7f9, cards brancos, tipografia moderna
+# VISUAL DO PAINEL ADMINISTRATIVO (MANTIDO EXATAMENTE COMO ESTAVA)
 # ----------------------------------------------------------------------
 PAGE_STYLE = """
 <style>
